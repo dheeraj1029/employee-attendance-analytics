@@ -470,6 +470,123 @@ def department_summary(
     return {"month": month, "items": items}
 
 
+def _sorted_dates_in_range(start_date: date, end_date: date) -> list[date]:
+    return [start_date + timedelta(days=offset) for offset in range((end_date - start_date).days + 1)]
+
+
+def _trend_for_department_fallback(department: str, from_date: date, to_date: date) -> list[dict[str, Any]]:
+    dates = _sorted_dates_in_range(from_date, to_date)
+    employee_rows = list(
+        db.employees.find(
+            {"department": department, "joined_on": {"$lte": to_date.isoformat()}},
+            {"_id": 0, "emp_code": 1, "joined_on": 1},
+        )
+    )
+    headcount_by_date: dict[str, int] = {day.isoformat(): 0 for day in dates}
+    for row in employee_rows:
+        joined_on = date.fromisoformat(row["joined_on"])
+        for day in dates:
+            if joined_on <= day:
+                headcount_by_date[day.isoformat()] += 1
+
+    join_dates_by_emp = {
+        row["emp_code"]: date.fromisoformat(row["joined_on"])
+        for row in db.employees.find({"department": department, "joined_on": {"$lte": to_date.isoformat()}}, {"_id": 0, "emp_code": 1, "joined_on": 1})
+    }
+    attendance_rows = list(
+        db.attendance_logs.aggregate([
+            {"$match": {"date": {"$gte": from_date.isoformat(), "$lte": to_date.isoformat()}}},
+            {"$lookup": {
+                "from": "employees",
+                "localField": "emp_code",
+                "foreignField": "emp_code",
+                "as": "employee",
+            }},
+            {"$unwind": "$employee"},
+            {"$match": {"employee.department": department}},
+            {"$project": {
+                "date": 1,
+                "status": 1,
+                "half_day": 1,
+                "late_minutes": {"$ifNull": ["$late_minutes", 0]},
+                "emp_code": 1,
+            }},
+            {"$sort": {"date": 1}},
+        ])
+    )
+
+    attendance_by_date: dict[str, dict[str, Any]] = {}
+    for row in attendance_rows:
+        joined_on = join_dates_by_emp.get(row["emp_code"])
+        if joined_on is None or joined_on > date.fromisoformat(row["date"]):
+            continue
+        day_bucket = attendance_by_date.setdefault(row["date"], {"present_count": Decimal("0"), "late_count": 0})
+        if row.get("status") in PRESENCE_STATUS:
+            present_value = Decimal("0.5") if row.get("half_day") is True else Decimal("1")
+            day_bucket["present_count"] += present_value
+        if row.get("late_minutes", 0) and int(row["late_minutes"]) > 0:
+            day_bucket["late_count"] += 1
+
+    daily_rows: list[dict[str, Any]] = []
+    for day in dates:
+        iso = day.isoformat()
+        is_working_day = day.weekday() < 5
+        headcount = headcount_by_date.get(iso, 0)
+        day_stats = attendance_by_date.get(iso, {"present_count": Decimal("0"), "late_count": 0})
+        present_count = Decimal(str(day_stats["present_count"]))
+        late_count = int(day_stats["late_count"])
+        attendance_rate = None
+        if is_working_day and headcount > 0:
+            attendance_rate = float(
+                round_half_up((present_count / Decimal(headcount)), "0.0001")
+            )
+        daily_rows.append({
+            "date": iso,
+            "is_working_day": is_working_day,
+            "headcount": headcount,
+            "present_count": float(present_count),
+            "late_count": late_count,
+            "attendance_rate": attendance_rate,
+        })
+
+    for index, row in enumerate(daily_rows):
+        window_values = [
+            prior_row["attendance_rate"]
+            for prior_row in daily_rows[max(0, index - 6): index + 1]
+            if prior_row["attendance_rate"] is not None
+        ]
+        if not window_values:
+            row["moving_avg_7d"] = None
+        else:
+            average = sum(Decimal(str(value)) for value in window_values) / Decimal(len(window_values))
+            row["moving_avg_7d"] = float(round_half_up(average, "0.0001"))
+
+    return daily_rows
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    from_date: date = Query(..., alias="from"),
+    to_date: date = Query(..., alias="to"),
+) -> dict[str, Any]:
+    if to_date < from_date:
+        raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail="to must be greater than or equal to from")
+    if (to_date - from_date).days + 1 > 92:
+        raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail="date range must not exceed 92 days")
+
+    if db.employees.find_one({"department": department}) is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="department not found")
+
+    try:
+        rows = _trend_for_department_fallback(department, from_date, to_date)
+        if not rows:
+            return {"department": department, "items": []}
+        return {"department": department, "items": rows}
+    except Exception:
+        raise
+
+
 @app.get("/analytics/leaderboard/late")
 def late_leaderboard(
     month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
