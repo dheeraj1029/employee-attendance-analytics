@@ -51,6 +51,35 @@ def test_punch_in_creates_record_and_duplicate_conflict(monkeypatch):
     assert duplicate.status_code == 409
 
 
+def test_punch_instants_are_truncated_to_whole_seconds(monkeypatch):
+    client = _client_with_db(monkeypatch)
+    explicit_null = client.post(
+        "/attendance/punch-in",
+        json={"emp_code": "EMP0011", "punched_at": None},
+    )
+    assert explicit_null.status_code == 422
+
+    client.post(
+        "/employees",
+        json={
+            "emp_code": "EMP0011",
+            "name": "Fractional",
+            "email": "fractional@example.com",
+            "department": "Engineering",
+            "shift_start": "09:30",
+            "shift_end": "18:30",
+            "joined_on": "2026-01-05",
+        },
+    )
+    fractional_ms = _ms(datetime(2026, 7, 6, 3, 58, tzinfo=timezone.utc)) + 987
+    response = client.post(
+        "/attendance/punch-in",
+        json={"emp_code": "EMP0011", "punched_at": fractional_ms},
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["punch_in"] == _ms(datetime(2026, 7, 6, 3, 58, tzinfo=timezone.utc))
+
+
 def test_punch_in_uses_overnight_date_and_rejects_missing_employee(monkeypatch):
     client = _client_with_db(monkeypatch)
     client.post(
@@ -136,6 +165,30 @@ def test_punch_out_rejects_invalid_window(monkeypatch):
         json={"emp_code": "EMP0004", "punched_at": _ms(datetime(2026, 7, 6, 3, 5, tzinfo=timezone.utc))},
     )
     assert invalid.status_code == 422
+
+
+def test_punch_out_does_not_close_a_future_punch_in(monkeypatch):
+    client = _client_with_db(monkeypatch)
+    client.post(
+        "/employees",
+        json={
+            "emp_code": "EMP0012",
+            "name": "Future Punch",
+            "email": "future@example.com",
+            "department": "Support",
+            "shift_start": "09:00",
+            "shift_end": "17:00",
+            "joined_on": "2026-01-05",
+        },
+    )
+    punch_in_ms = _ms(datetime(2026, 7, 6, 13, 0, tzinfo=timezone.utc))
+    client.post("/attendance/punch-in", json={"emp_code": "EMP0012", "punched_at": punch_in_ms})
+
+    too_early = client.post(
+        "/attendance/punch-out",
+        json={"emp_code": "EMP0012", "punched_at": punch_in_ms - 1000},
+    )
+    assert too_early.status_code == 422
 
 
 def test_half_day_calculated_correctly(monkeypatch):
@@ -273,6 +326,87 @@ def test_regularization_updates_history_and_recomputes_fields(monkeypatch):
         },
     )
     assert no_op.status_code == 422
+
+
+def test_regularization_handles_missing_history_and_records_derived_changes(monkeypatch):
+    mock_db = mongomock.MongoClient().db
+    monkeypatch.setattr(main, "db", mock_db)
+    main.ensure_indexes()
+    client = TestClient(main.app)
+    mock_db.employees.insert_one(
+        {
+            "emp_code": "EMP0013",
+            "name": "Seeded",
+            "email": "seeded@example.com",
+            "department": "Engineering",
+            "shift_start": "09:30",
+            "shift_end": "18:30",
+            "joined_on": "2026-01-05",
+            "created_at": datetime.now(timezone.utc),
+        }
+    )
+    mock_db.attendance_logs.insert_one(
+        {
+            "emp_code": "EMP0013",
+            "date": "2026-07-06",
+            "status": "PRESENT",
+            "punch_in": datetime(2026, 7, 6, 3, 58, tzinfo=timezone.utc),
+            "punch_out": None,
+            "work_hours": None,
+            "late_minutes": 0,
+            "overtime_minutes": 0,
+            "half_day": False,
+        }
+    )
+
+    response = client.patch(
+        "/attendance/EMP0013/2026-07-06",
+        json={
+            "punch_in": _ms(datetime(2026, 7, 6, 4, 15, tzinfo=timezone.utc)),
+            "reason": "Corrected punch time",
+            "regularized_by": "hr-team",
+        },
+    )
+    assert response.status_code == 200, response.text
+    changes = response.json()["history"][0]["changes"]
+    assert changes["punch_in"]["from"] == _ms(datetime(2026, 7, 6, 3, 58, tzinfo=timezone.utc))
+    assert changes["late_minutes"] == {"from": 0, "to": 15}
+
+
+def test_attendance_and_regularization_reject_invalid_calendar_dates(monkeypatch):
+    client = _client_with_db(monkeypatch)
+    invalid_list_date = client.get("/attendance?date_from=2026-02-30")
+    assert invalid_list_date.status_code == 422
+
+    invalid_patch_date = client.patch(
+        "/attendance/EMP0014/2026-02-30",
+        json={"status": "ABSENT", "reason": "Date correction", "regularized_by": "hr-team"},
+    )
+    assert invalid_patch_date.status_code == 422
+
+
+def test_attendance_listing_serializes_seeded_default_fields(monkeypatch):
+    db = mongomock.MongoClient().db
+    monkeypatch.setattr(main, "db", db)
+    main.ensure_indexes()
+    db.attendance_logs.insert_one(
+        {
+            "emp_code": "EMP0015",
+            "date": "2026-07-06",
+            "status": "PRESENT",
+            "punch_in": None,
+            "punch_out": None,
+            "work_hours": None,
+        }
+    )
+
+    response = TestClient(main.app).get("/attendance")
+    assert response.status_code == 200
+    row = response.json()["items"][0]
+    assert row["late_minutes"] == 0
+    assert row["overtime_minutes"] == 0
+    assert row["half_day"] is False
+    assert row["history"] == []
 
 
 def test_concurrent_punch_in_and_punch_out_are_atomic(monkeypatch):

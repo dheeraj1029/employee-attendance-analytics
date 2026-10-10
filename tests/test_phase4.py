@@ -1,20 +1,16 @@
 from datetime import datetime, timezone
 
-import mongomock
 from fastapi.testclient import TestClient
 
 from app import main
 
 
-def _client_with_db(monkeypatch):
-    mock_db = mongomock.MongoClient().db
-    monkeypatch.setattr(main, "db", mock_db)
-    main.ensure_indexes()
-    return mock_db, TestClient(main.app)
+def _client_with_db(database):
+    return database, TestClient(main.app)
 
 
-def test_department_summary_aggregates_counts_and_rounding(monkeypatch):
-    db, client = _client_with_db(monkeypatch)
+def test_department_summary_aggregates_counts_and_rounding(analytics_database):
+    db, client = _client_with_db(analytics_database)
     db.employees.insert_many(
         [
             {
@@ -172,8 +168,8 @@ def test_department_summary_aggregates_counts_and_rounding(monkeypatch):
     assert support["on_duty_count"] == 1
 
 
-def test_department_summary_optional_department_filter_and_no_matching_department(monkeypatch):
-    db, client = _client_with_db(monkeypatch)
+def test_department_summary_optional_department_filter_and_no_matching_department(analytics_database):
+    db, client = _client_with_db(analytics_database)
     db.employees.insert_many(
         [
             {
@@ -225,8 +221,8 @@ def test_department_summary_optional_department_filter_and_no_matching_departmen
     assert empty.json()["items"] == []
 
 
-def test_department_summary_ignores_future_joiners_and_keeps_zero_log_departments(monkeypatch):
-    db, client = _client_with_db(monkeypatch)
+def test_department_summary_ignores_future_joiners_and_keeps_zero_log_departments(analytics_database):
+    db, client = _client_with_db(analytics_database)
     db.employees.insert_many(
         [
             {
@@ -285,3 +281,37 @@ def test_department_summary_ignores_future_joiners_and_keeps_zero_log_department
     assert items_by_dept["Finance"]["headcount"] == 1
     assert items_by_dept["Finance"]["present_days"] == 0.0
     assert items_by_dept["Finance"]["avg_work_hours"] is None
+
+
+def test_department_summary_rounds_work_hour_average_half_up_to_two_places(analytics_database):
+    db, client = _client_with_db(analytics_database)
+    db.employees.insert_one(
+        {
+            "emp_code": "EMP0430",
+            "name": "Rounding",
+            "email": "rounding@example.com",
+            "department": "Finance",
+            "shift_start": "09:00",
+            "shift_end": "17:00",
+            "joined_on": "2026-07-01",
+            "created_at": datetime.now(timezone.utc),
+        }
+    )
+    db.attendance_logs.insert_one(
+        {
+            "emp_code": "EMP0430",
+            "date": "2026-07-06",
+            "status": "PRESENT",
+            "punch_in": datetime(2026, 7, 6, 4, 0, tzinfo=timezone.utc),
+            "punch_out": datetime(2026, 7, 6, 12, 0, tzinfo=timezone.utc),
+            "work_hours": 8.125,
+            "late_minutes": 0,
+            "overtime_minutes": 0,
+            "half_day": False,
+            "history": [],
+        }
+    )
+
+    response = client.get("/analytics/departments/summary?month=2026-07")
+    assert response.status_code == 200, response.text
+    assert response.json()["items"][0]["avg_work_hours"] == 8.13

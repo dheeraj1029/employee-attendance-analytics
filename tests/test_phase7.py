@@ -114,19 +114,19 @@ def test_explain_runs_all_supported_operations_with_real_execution_stats(live_mo
     _, database = live_mongo_client
     client = TestClient(main.app)
     requests = [
-        ("/admin/explain/attendance_list?emp_code=EMP0701&date_from=2026-07-01&date_to=2026-07-31&page=1&page_size=10", "attendance_list"),
-        ("/admin/explain/employee_monthly?emp_code=EMP0701&month=2026-07", "employee_monthly"),
-        ("/admin/explain/department_summary?month=2026-07&department=Engineering", "department_summary"),
-        ("/admin/explain/late_leaderboard?month=2026-07&limit=10&department=Engineering", "late_leaderboard"),
-        ("/admin/explain/department_trend?department=Engineering&from=2026-07-01&to=2026-07-10", "department_trend"),
+        ("/admin/explain/attendance_list?emp_code=EMP0701&date_from=2026-07-01&date_to=2026-07-31&page=1&page_size=10", "attendance_list", "attendance_logs"),
+        ("/admin/explain/employee_monthly?emp_code=EMP0701&month=2026-07", "employee_monthly", "employees"),
+        ("/admin/explain/department_summary?month=2026-07&department=Engineering", "department_summary", "employees"),
+        ("/admin/explain/late_leaderboard?month=2026-07&limit=10&department=Engineering", "late_leaderboard", "attendance_logs"),
+        ("/admin/explain/department_trend?department=Engineering&from=2026-07-01&to=2026-07-10", "department_trend", "employees"),
     ]
 
-    for url, endpoint in requests:
+    for url, endpoint, collection in requests:
         response = client.get(url)
         assert response.status_code == 200, response.text
         body = response.json()
         assert body["endpoint"] == endpoint
-        assert body["collection"] == "attendance_logs"
+        assert body["collection"] == collection
         assert _contains_key(body["explain"], "executionStats")
         serialized_explain = json.dumps(body["explain"])
         assert "IXSCAN" in serialized_explain

@@ -1,7 +1,7 @@
-# DECISIONS.md  (about 150-200 words in total - plain language, your own words)
+# Design decisions
 
-1. **Indexes.** Which indexes did you create, and which query or guarantee does each one serve? Which one did you consider and reject?
-2. **Punch-in race.** Two identical punch-in requests arrive at the same instant. Walk through exactly what happens in your code.
-3. **Ties.** Two employees are tied on late minutes at the cutoff of `limit`. What does your leaderboard return, and why?
-4. **Headcount.** How does your department summary make sure employees with zero logs are counted?
-5. **One thing you would change** if this had to serve 100x the data.
+1. **Indexes.** Unique `employees.emp_code` and `attendance_logs(emp_code, date)` indexes enforce natural-key uniqueness. Attendance indexes on employee/date, date/employee (ascending and descending), status/date/employee, and employee/punch-in serve common filters and sorts. Department/employee and department/join-date indexes support headcount queries. I rejected an index on `late_minutes`; monthly date filters select records first.
+2. **Punch-in race.** Both requests may attempt the insert, but the unique compound attendance index accepts only one document for an employee/date. The loser receives `DuplicateKeyError`, translated to 409; the successful insert returns 201. There is no check-then-insert guarantee.
+3. **Ties.** MongoDB `$rank` applies standard competition ranking over descending total late minutes; a final sort stabilizes tied rows by `emp_code`. The rank cutoff is applied after ranking, so all employees tied at a rank within `limit` are returned.
+4. **Headcount.** Department summary starts from employees eligible by month end and looks up that employee's monthly logs. This preserves employees without logs in the department's headcount and excludes future joiners.
+5. **100x scale.** Metric accumulation, ranking, trend calendar generation, and moving averages run in MongoDB aggregation. Next I would profile production data, validate on MongoDB 6.0, and tune indexes before considering partitioning or sharding. No 100x performance claim is verified.

@@ -1,20 +1,16 @@
 from datetime import datetime, timezone
 
-import mongomock
 from fastapi.testclient import TestClient
 
 from app import main
 
 
-def _client_with_db(monkeypatch):
-    mock_db = mongomock.MongoClient().db
-    monkeypatch.setattr(main, "db", mock_db)
-    main.ensure_indexes()
-    return mock_db, TestClient(main.app)
+def _client_with_db(database):
+    return database, TestClient(main.app)
 
 
-def test_late_leaderboard_aggregates_by_employee_and_rank(monkeypatch):
-    db, client = _client_with_db(monkeypatch)
+def test_late_leaderboard_aggregates_by_employee_and_rank(analytics_database):
+    db, client = _client_with_db(analytics_database)
     db.employees.insert_many(
         [
             {
@@ -146,8 +142,8 @@ def test_late_leaderboard_aggregates_by_employee_and_rank(monkeypatch):
     assert [item["late_count"] for item in body["items"]] == [2, 1, 1, 2]
 
 
-def test_late_leaderboard_limit_applies_after_ranking_and_department_filter(monkeypatch):
-    db, client = _client_with_db(monkeypatch)
+def test_late_leaderboard_limit_applies_after_ranking_and_department_filter(analytics_database):
+    db, client = _client_with_db(analytics_database)
     db.employees.insert_many(
         [
             {
@@ -194,6 +190,11 @@ def test_late_leaderboard_limit_applies_after_ranking_and_department_filter(monk
     assert limited.status_code == 200, limited.text
     assert [item["emp_code"] for item in limited.json()["items"]] == ["EMP0512"]
 
+    tied_at_limit = client.get("/analytics/leaderboard/late?month=2026-07&limit=2")
+    assert tied_at_limit.status_code == 200, tied_at_limit.text
+    assert [item["emp_code"] for item in tied_at_limit.json()["items"]] == ["EMP0512", "EMP0510", "EMP0511"]
+    assert [item["rank"] for item in tied_at_limit.json()["items"]] == [1, 2, 2]
+
     department_only = client.get("/analytics/leaderboard/late?month=2026-07&department=Engineering")
     assert department_only.status_code == 200, department_only.text
     payload = department_only.json()
@@ -201,8 +202,8 @@ def test_late_leaderboard_limit_applies_after_ranking_and_department_filter(monk
     assert [item["rank"] for item in payload["items"]] == [1, 1]
 
 
-def test_late_leaderboard_excludes_no_late_minutes_and_handles_invalid_input(monkeypatch):
-    db, client = _client_with_db(monkeypatch)
+def test_late_leaderboard_excludes_no_late_minutes_and_handles_invalid_input(analytics_database):
+    db, client = _client_with_db(analytics_database)
     db.employees.insert_many(
         [
             {
@@ -245,8 +246,8 @@ def test_late_leaderboard_excludes_no_late_minutes_and_handles_invalid_input(mon
     assert invalid_limit.status_code == 422
 
 
-def test_late_leaderboard_uses_weekend_records_and_empty_results(monkeypatch):
-    db, client = _client_with_db(monkeypatch)
+def test_late_leaderboard_uses_weekend_records_and_empty_results(analytics_database):
+    db, client = _client_with_db(analytics_database)
     db.employees.insert_many(
         [
             {

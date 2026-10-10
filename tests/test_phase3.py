@@ -1,16 +1,12 @@
 from datetime import date, timedelta
 
-import mongomock
 from fastapi.testclient import TestClient
 
 from app import main
 
 
-def _client_with_db(monkeypatch):
-    mock_db = mongomock.MongoClient().db
-    monkeypatch.setattr(main, "db", mock_db)
-    main.ensure_indexes()
-    return mock_db
+def _client_with_db(database):
+    return database
 
 
 def _working_days_in_month(joined_on: str, month: str) -> int:
@@ -31,8 +27,8 @@ def _working_days_in_month(joined_on: str, month: str) -> int:
     return total
 
 
-def test_employee_monthly_summary_uses_stored_derived_values(monkeypatch):
-    db = _client_with_db(monkeypatch)
+def test_employee_monthly_summary_uses_stored_derived_values(analytics_database):
+    db = _client_with_db(analytics_database)
     client = TestClient(main.app)
     db.employees.insert_one(
         {
@@ -118,8 +114,8 @@ def test_employee_monthly_summary_uses_stored_derived_values(monkeypatch):
     assert body["attendance_pct"] == expected_pct
 
 
-def test_employee_monthly_summary_handles_missing_records_invalid_month_and_unknown_employee(monkeypatch):
-    db = _client_with_db(monkeypatch)
+def test_employee_monthly_summary_handles_missing_records_invalid_month_and_unknown_employee(analytics_database):
+    db = _client_with_db(analytics_database)
     client = TestClient(main.app)
     db.employees.insert_one(
         {
@@ -152,8 +148,8 @@ def test_employee_monthly_summary_handles_missing_records_invalid_month_and_unkn
     assert missing.status_code == 404
 
 
-def test_employee_monthly_summary_counts_mid_month_joining_and_ignores_weekends(monkeypatch):
-    db = _client_with_db(monkeypatch)
+def test_employee_monthly_summary_counts_mid_month_joining_and_ignores_weekends(analytics_database):
+    db = _client_with_db(analytics_database)
     client = TestClient(main.app)
     db.employees.insert_one(
         {

@@ -1,26 +1,82 @@
-# Candidate kit
+# Employee Attendance & Analytics API
 
-Read in this order:
+FastAPI and PyMongo implementation of the HROne employee attendance assignment. The API contract and business rules are
+defined in [openapi.yaml](./openapi.yaml); MongoDB document shapes are defined in [DATA_MODEL.md](./DATA_MODEL.md).
 
-1. `PROBLEM_STATEMENT.docx`: what you are asked to do, how it is evaluated.
-2. `openapi.yaml`: the API contract and the business rules (R1 - R10).
-3. `DATA_MODEL.md`: what is stored in MongoDB, with nine sample documents.
-4. `app/main.py`: the starter. Put **all** your code in this one file. It must start with `uvicorn app.main:app --port 8000`.
-5. `REVIEW.md`, `DECISIONS.md`: templates to fill in.
+## Prerequisites
 
-`sample_data/` holds the nine sample documents as MongoDB Extended JSON; `sample_seed.py` loads them. The grader's dataset is
-much larger and contains cases they do not show.
+- Python 3.11 or newer
+- MongoDB 6.0 or newer (the assignment targets MongoDB 7.0)
 
 ## Local setup
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env            # set MONGO_URI / MONGO_DB (local docker: docker run -p 27017:27017 mongo:7)
-python sample_seed.py
-uvicorn app.main:app --port 8000 --reload
-```
-MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free tier (M0) works.
 
-## Submit
-A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
-No `.env`, no secrets, no Dockerfile.
+From this directory, create and activate a virtual environment, then install dependencies:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+On macOS or Linux, use `python3.11 -m venv .venv` and `source .venv/bin/activate`.
+
+Set the connection configuration in the process environment. For example, in PowerShell:
+
+```powershell
+$env:MONGO_URI = "mongodb://localhost:27017"
+$env:MONGO_DB = "attendance_db"
+```
+
+The same values may be placed in a local `.env` file; `python-dotenv` loads it, while real environment variables take
+priority. The application defaults to the local URI above and database `attendance_db`. Do not commit `.env` files or
+credentials.
+
+Start the API:
+
+```powershell
+python -m uvicorn app.main:app --port 8000
+```
+
+Check readiness at `http://localhost:8000/health`. The API creates its indexes at startup. To load the sample documents,
+run `python sample_seed.py` with the same MongoDB configuration.
+
+## Endpoints
+
+- `GET /health`
+- `POST, GET /employees`
+- `POST /attendance/punch-in`
+- `POST /attendance/punch-out`
+- `GET /attendance`
+- `PATCH /attendance/{emp_code}/{date}`
+- `GET /analytics/employees/{emp_code}/monthly`
+- `GET /analytics/departments/summary`
+- `GET /analytics/leaderboard/late`
+- `GET /analytics/departments/{department}/trend`
+- `GET /admin/explain/{endpoint}`
+
+Instants use epoch milliseconds at the API boundary and BSON UTC datetimes in MongoDB. Attendance dates and shift times
+are interpreted in IST. The implementation includes overnight shift dates, late/overtime/work-hours/half-day rules,
+database-enforced uniqueness for employee and attendance keys, atomic punch-out, and regularization history. Analytics
+uses MongoDB aggregation for metric accumulation, competition ranking, and department trend calendar generation and
+moving averages. Stored derived attendance fields are authoritative; weekday calculations exclude weekends where
+required, and department headcount includes eligible employees without logs. The pipelines use operators available in
+MongoDB 6.0, including `$dateAdd`, `$dateDiff`, `$rank`, and `$setWindowFields` (introduced in MongoDB 5.0).
+
+## Tests
+
+Run the automated suite and compile check:
+
+```powershell
+python -m pytest -q tests/
+python -m compileall -q app tests
+```
+
+Employee and attendance endpoint tests use `mongomock`. Analytics and explain integration tests connect to
+`mongodb://localhost:27017`, use uniquely named temporary databases, and skip when MongoDB is unavailable. The current
+validation environment ran them on MongoDB 8.2.1; MongoDB 6.0 has not been separately tested.
+
+## Limitations
+
+The assignment's large-dataset behavior has not been verified against its approximately 100,000 attendance records.
+Explain-plan checks and aggregation integration tests used small fixtures. No performance or latency claim is made for
+the target dataset or production workloads.
