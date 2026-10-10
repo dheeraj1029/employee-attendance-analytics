@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, status as http_status
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 from pymongo import MongoClient, errors
+from pymongo.errors import PyMongoError
+from bson import json_util
 
 load_dotenv()
 
@@ -114,10 +116,106 @@ def round_half_up(value: Decimal, places: str = "0.0001") -> Decimal:
 def ensure_indexes() -> None:
     db.employees.create_index([("emp_code", 1)], unique=True, name="ux_employees_emp_code")
     db.employees.create_index([("department", 1), ("emp_code", 1)], name="ix_employees_department_emp")
+    db.employees.create_index([("department", 1), ("joined_on", 1)], name="ix_employees_department_joined")
+    db.employees.create_index([("joined_on", 1), ("department", 1)], name="ix_employees_joined_department")
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True, name="ux_attendance_logs_emp_date")
     db.attendance_logs.create_index([("emp_code", 1), ("punch_in", 1)], name="ix_attendance_logs_emp_punchin")
     db.attendance_logs.create_index([("date", 1), ("emp_code", 1)], name="ix_attendance_logs_date_emp")
+    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)], name="ix_attendance_logs_date_desc_emp")
+    db.attendance_logs.create_index([("status", 1), ("date", -1), ("emp_code", 1)], name="ix_attendance_logs_status_date_emp")
     db.attendance_logs.create_index([("status", 1)], name="ix_attendance_logs_status")
+
+
+def attendance_list_filter(
+    emp_code: Optional[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    status_value: Optional[str],
+) -> dict[str, Any]:
+    query: dict[str, Any] = {}
+    if emp_code is not None:
+        query["emp_code"] = emp_code
+    if date_from is not None or date_to is not None:
+        date_filter: dict[str, str] = {}
+        if date_from is not None:
+            date_filter["$gte"] = date_from
+        if date_to is not None:
+            date_filter["$lte"] = date_to
+        query["date"] = date_filter
+    if status_value is not None:
+        query["status"] = status_value
+    return query
+
+
+def monthly_aggregation_pipeline(emp_code: str, month_start: date, month_end: date) -> list[dict[str, Any]]:
+    return [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": month_start.isoformat(), "$lte": month_end.isoformat()}}},
+        {"$group": {
+            "_id": None,
+            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, "$late_minutes", 0]}},
+            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+        }},
+    ]
+
+
+def leaderboard_aggregation_pipeline(month_start: date, month_end: date, department: Optional[str]) -> list[dict[str, Any]]:
+    pipeline: list[dict[str, Any]] = [
+        {"$match": {"date": {"$gte": month_start.isoformat(), "$lte": month_end.isoformat()}}},
+        {"$lookup": {
+            "from": "employees",
+            "localField": "emp_code",
+            "foreignField": "emp_code",
+            "as": "employee",
+        }},
+        {"$unwind": "$employee"},
+        {"$match": {"employee.joined_on": {"$lte": month_end.isoformat()}}},
+    ]
+    if department is not None:
+        pipeline.append({"$match": {"employee.department": department}})
+    pipeline.extend([
+        {"$group": {
+            "_id": "$emp_code",
+            "name": {"$first": "$employee.name"},
+            "department": {"$first": "$employee.department"},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]}},
+        }},
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+    ])
+    return pipeline
+
+
+def department_summary_attendance_pipeline(
+    month_start: date,
+    month_end: date,
+    department: Optional[str],
+) -> list[dict[str, Any]]:
+    pipeline: list[dict[str, Any]] = [
+        {"$match": {"date": {"$gte": month_start.isoformat(), "$lte": month_end.isoformat()}}},
+        {"$lookup": {
+            "from": "employees",
+            "localField": "emp_code",
+            "foreignField": "emp_code",
+            "as": "employee",
+        }},
+        {"$unwind": "$employee"},
+        {"$match": {"employee.joined_on": {"$lte": month_end.isoformat()}}},
+        {"$project": {
+            "department": "$employee.department",
+            "status": 1,
+            "date": 1,
+            "half_day": 1,
+            "late_minutes": 1,
+            "work_hours": 1,
+        }},
+    ]
+    if department is not None:
+        pipeline.append({"$match": {"department": department}})
+    pipeline.append({"$sort": {"department": 1, "date": 1}})
+    return pipeline
 
 
 @app.on_event("startup")
@@ -293,16 +391,7 @@ def employee_monthly(
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="employee not found")
 
     month_start, month_end = month_range(month)
-    pipeline = [
-        {"$match": {"emp_code": emp_code, "date": {"$gte": month_start.isoformat(), "$lte": month_end.isoformat()}}},
-        {"$group": {
-            "_id": None,
-            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
-            "late_count": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]}},
-            "total_late_minutes": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, "$late_minutes", 0]}},
-            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
-        }},
-    ]
+    pipeline = monthly_aggregation_pipeline(emp_code, month_start, month_end)
     agg_row = next(db.attendance_logs.aggregate(pipeline), {})
 
     records = list(
@@ -370,33 +459,8 @@ def department_summary(
     if not headcount_by_department:
         return {"month": month, "items": []}
 
-    attendance_match: dict[str, Any] = {"date": {"$gte": month_start.isoformat(), "$lte": month_end.isoformat()}}
-    if department is not None:
-        attendance_match["department"] = department
-
-    attendance_rows = list(
-        db.attendance_logs.aggregate([
-            {"$match": {"date": {"$gte": month_start.isoformat(), "$lte": month_end.isoformat()}}},
-            {"$lookup": {
-                "from": "employees",
-                "localField": "emp_code",
-                "foreignField": "emp_code",
-                "as": "employee",
-            }},
-            {"$unwind": "$employee"},
-            {"$match": {"employee.joined_on": {"$lte": month_end.isoformat()}}},
-            {"$project": {
-                "department": "$employee.department",
-                "status": 1,
-                "date": 1,
-                "half_day": 1,
-                "late_minutes": 1,
-                "work_hours": 1,
-            }},
-            {"$match": attendance_match if department is not None else {}},
-            {"$sort": {"department": 1, "date": 1}},
-        ])
-    )
+    attendance_pipeline = department_summary_attendance_pipeline(month_start, month_end, department)
+    attendance_rows = list(db.attendance_logs.aggregate(attendance_pipeline))
 
     department_metrics: dict[str, dict[str, Any]] = {}
     for dept in sorted(headcount_by_department):
@@ -474,6 +538,32 @@ def _sorted_dates_in_range(start_date: date, end_date: date) -> list[date]:
     return [start_date + timedelta(days=offset) for offset in range((end_date - start_date).days + 1)]
 
 
+def department_trend_aggregation_pipeline(
+    department: str,
+    from_date: date,
+    to_date: date,
+) -> list[dict[str, Any]]:
+    return [
+        {"$match": {"date": {"$gte": from_date.isoformat(), "$lte": to_date.isoformat()}}},
+        {"$lookup": {
+            "from": "employees",
+            "localField": "emp_code",
+            "foreignField": "emp_code",
+            "as": "employee",
+        }},
+        {"$unwind": "$employee"},
+        {"$match": {"employee.department": department}},
+        {"$project": {
+            "date": 1,
+            "status": 1,
+            "half_day": 1,
+            "late_minutes": {"$ifNull": ["$late_minutes", 0]},
+            "emp_code": 1,
+        }},
+        {"$sort": {"date": 1}},
+    ]
+
+
 def _trend_for_department_fallback(department: str, from_date: date, to_date: date) -> list[dict[str, Any]]:
     dates = _sorted_dates_in_range(from_date, to_date)
     employee_rows = list(
@@ -494,25 +584,7 @@ def _trend_for_department_fallback(department: str, from_date: date, to_date: da
         for row in db.employees.find({"department": department, "joined_on": {"$lte": to_date.isoformat()}}, {"_id": 0, "emp_code": 1, "joined_on": 1})
     }
     attendance_rows = list(
-        db.attendance_logs.aggregate([
-            {"$match": {"date": {"$gte": from_date.isoformat(), "$lte": to_date.isoformat()}}},
-            {"$lookup": {
-                "from": "employees",
-                "localField": "emp_code",
-                "foreignField": "emp_code",
-                "as": "employee",
-            }},
-            {"$unwind": "$employee"},
-            {"$match": {"employee.department": department}},
-            {"$project": {
-                "date": 1,
-                "status": 1,
-                "half_day": 1,
-                "late_minutes": {"$ifNull": ["$late_minutes", 0]},
-                "emp_code": 1,
-            }},
-            {"$sort": {"date": 1}},
-        ])
+        db.attendance_logs.aggregate(department_trend_aggregation_pipeline(department, from_date, to_date))
     )
 
     attendance_by_date: dict[str, dict[str, Any]] = {}
@@ -587,6 +659,102 @@ def department_trend(
         raise
 
 
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: Literal[
+        "attendance_list",
+        "employee_monthly",
+        "department_summary",
+        "late_leaderboard",
+        "department_trend",
+    ],
+    emp_code: Optional[str] = Query(default=None),
+    month: Optional[str] = Query(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = Query(default=None),
+    limit: int = Query(default=10, ge=1, le=50),
+    date_from: Optional[date] = Query(default=None),
+    date_to: Optional[date] = Query(default=None),
+    status_: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = Query(default=None, alias="status"),
+    from_date: Optional[date] = Query(default=None, alias="from"),
+    to_date: Optional[date] = Query(default=None, alias="to"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> dict[str, Any]:
+    collection_name: str
+    operation: dict[str, Any]
+
+    if endpoint == "attendance_list":
+        if date_from is not None and date_to is not None and date_from > date_to:
+            raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail="date_from must be <= date_to")
+        collection_name = "attendance_logs"
+        operation = {
+            "find": collection_name,
+            "filter": attendance_list_filter(
+                emp_code,
+                date_from.isoformat() if date_from else None,
+                date_to.isoformat() if date_to else None,
+                status_,
+            ),
+            "projection": {"_id": 0},
+            "sort": {"date": -1, "emp_code": 1},
+            "skip": (page - 1) * page_size,
+            "limit": page_size,
+        }
+    elif endpoint == "employee_monthly":
+        if emp_code is None or month is None:
+            raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail="emp_code and month are required")
+        month_start, month_end = month_range(month)
+        collection_name = "attendance_logs"
+        operation = {
+            "aggregate": collection_name,
+            "pipeline": monthly_aggregation_pipeline(emp_code, month_start, month_end),
+            "cursor": {},
+        }
+    elif endpoint == "department_summary":
+        if month is None:
+            raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail="month is required")
+        month_start, month_end = month_range(month)
+        collection_name = "attendance_logs"
+        operation = {
+            "aggregate": collection_name,
+            "pipeline": department_summary_attendance_pipeline(month_start, month_end, department),
+            "cursor": {},
+        }
+    elif endpoint == "late_leaderboard":
+        if month is None:
+            raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail="month is required")
+        month_start, month_end = month_range(month)
+        collection_name = "attendance_logs"
+        operation = {
+            "aggregate": collection_name,
+            "pipeline": leaderboard_aggregation_pipeline(month_start, month_end, department),
+            "cursor": {},
+        }
+    else:
+        if department is None or from_date is None or to_date is None:
+            raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail="department, from, and to are required")
+        if to_date < from_date:
+            raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail="to must be greater than or equal to from")
+        if (to_date - from_date).days + 1 > 92:
+            raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail="date range must not exceed 92 days")
+        if db.employees.find_one({"department": department}) is None:
+            raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="department not found")
+        collection_name = "attendance_logs"
+        operation = {
+            "aggregate": collection_name,
+            "pipeline": department_trend_aggregation_pipeline(department, from_date, to_date),
+            "cursor": {},
+        }
+
+    try:
+        explain_result = db.command("explain", operation, verbosity="executionStats")
+    except PyMongoError as exc:
+        raise HTTPException(status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR, detail="MongoDB explain failed") from exc
+
+    raw_explain = json_util.loads(json_util.dumps(explain_result))
+    return {"endpoint": endpoint, "collection": collection_name, "explain": raw_explain}
+
+
 @app.get("/analytics/leaderboard/late")
 def late_leaderboard(
     month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
@@ -594,31 +762,7 @@ def late_leaderboard(
     department: Optional[str] = Query(default=None),
 ) -> dict[str, Any]:
     month_start, month_end = month_range(month)
-    pipeline = [
-        {"$match": {"date": {"$gte": month_start.isoformat(), "$lte": month_end.isoformat()}}},
-        {"$lookup": {
-            "from": "employees",
-            "localField": "emp_code",
-            "foreignField": "emp_code",
-            "as": "employee",
-        }},
-        {"$unwind": "$employee"},
-        {"$match": {"employee.joined_on": {"$lte": month_end.isoformat()}}},
-    ]
-    if department is not None:
-        pipeline.append({"$match": {"employee.department": department}})
-    pipeline.extend([
-        {"$group": {
-            "_id": "$emp_code",
-            "name": {"$first": "$employee.name"},
-            "department": {"$first": "$employee.department"},
-            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
-            "late_count": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]}},
-        }},
-        {"$match": {"total_late_minutes": {"$gt": 0}}},
-        {"$sort": {"total_late_minutes": -1, "_id": 1}},
-    ])
-
+    pipeline = leaderboard_aggregation_pipeline(month_start, month_end, department)
     rows = list(db.attendance_logs.aggregate(pipeline))
     if not rows:
         return {"month": month, "items": []}
@@ -769,18 +913,7 @@ def list_attendance(
     if date_from and date_to and date_from > date_to:
         raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail="date_from must be <= date_to")
 
-    query: dict[str, Any] = {}
-    if emp_code is not None:
-        query["emp_code"] = emp_code
-    if date_from or date_to:
-        date_filter: dict[str, str] = {}
-        if date_from:
-            date_filter["$gte"] = date_from
-        if date_to:
-            date_filter["$lte"] = date_to
-        query["date"] = date_filter
-    if status_ is not None:
-        query["status"] = status_
+    query = attendance_list_filter(emp_code, date_from, date_to, status_)
 
     total = db.attendance_logs.count_documents(query)
     items = list(
