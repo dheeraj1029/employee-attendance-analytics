@@ -22,15 +22,6 @@ On macOS or Linux, use `python3.11 -m venv .venv` and `source .venv/bin/activate
 
 Set the connection configuration in the process environment. For example, in PowerShell:
 
-```powershell
-$env:MONGO_URI = "mongodb://localhost:27017"
-$env:MONGO_DB = "attendance_db"
-```
-
-The same values may be placed in a local `.env` file; `python-dotenv` loads it, while real environment variables take
-priority. The application defaults to the local URI above and database `attendance_db`. Do not commit `.env` files or
-credentials.
-
 Start the API:
 
 ```powershell
