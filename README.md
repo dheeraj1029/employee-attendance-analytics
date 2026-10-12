@@ -22,6 +22,11 @@ On macOS or Linux, use `python3.11 -m venv .venv` and `source .venv/bin/activate
 
 Set the connection configuration in the process environment. For example, in PowerShell:
 
+```powershell
+$env:MONGO_URI = "mongodb://localhost:27017"
+$env:MONGO_DB = "attendance_db"
+```
+
 Start the API:
 
 ```powershell
